@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:vosk_flutter/vosk_flutter.dart';
 
@@ -33,25 +34,34 @@ class SpeechToTextScreen extends StatefulWidget {
 }
 
 class _SpeechToTextScreenState extends State<SpeechToTextScreen> with WidgetsBindingObserver {
+  static const int _sampleRate = 16000;
+  static const String _modelName = 'vosk-model-small-pt-0.3';
+  
+  final _vosk = VoskFlutterPlugin.instance();
+  final _modelLoader = ModelLoader();
+  
+  Model? _model;
   Recognizer? _recognizer;
   SpeechService? _speechService;
   
-  ValueNotifier<String> _recognizerTextNotifier = ValueNotifier<String>('Pressione o botão para falar');
+  String _recognizedText = 'Pressione o botão para falar';
+  String? _error;
   bool _isRecording = false;
   bool _isModelReady = false;
+  bool _isLoading = true;
   
-  // Compute text extraction in an isolate
   static String computeTextExtraction(String message) {
     try {
       final Map<String, dynamic> jsonResult = jsonDecode(message);
       
-      // Prioritize text, fallback to partial
       String? text = jsonResult['text'] ?? jsonResult['partial'];
       
       return text?.trim() ?? 'Reconhecendo...';
     } catch (e) {
-      print('Text extraction error: $e');
-      return 'Erro ao processar texto';
+      if (kDebugMode) {
+        print('Text extraction error: $e');
+      }
+      return 'Reconhecendo...';
     }
   }
 
@@ -63,9 +73,18 @@ class _SpeechToTextScreenState extends State<SpeechToTextScreen> with WidgetsBin
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    
+    if (state == AppLifecycleState.paused || 
+        state == AppLifecycleState.inactive) {
+      _stopRecognition();
+    }
+  }
+
+  @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _recognizerTextNotifier.dispose();
     _cleanupResources();
     super.dispose();
   }
@@ -75,73 +94,135 @@ class _SpeechToTextScreenState extends State<SpeechToTextScreen> with WidgetsBin
       await _speechService?.stop();
       await _recognizer?.dispose();
     } catch (e) {
-      debugPrint('Resource cleanup error: $e');
+      if (kDebugMode) {
+        print('Resource cleanup error: $e');
+      }
     }
   }
 
   Future<void> _initVosk() async {
     try {
-      // Request microphone permission
+      setState(() {
+        _isLoading = true;
+        _recognizedText = 'Carregando modelo...';
+      });
+      
       final micStatus = await Permission.microphone.request();
       if (!micStatus.isGranted) {
         _showPermissionError();
         return;
       }
       
-      final vosk = VoskFlutterPlugin.instance();
+      final modelPath = await _modelLoader.loadFromAssets('assets/models/$_modelName.zip')
+        .catchError((error) {
+          if (kDebugMode) {
+            print('Model loading error: $error');
+          }
+          throw Exception('Falha ao carregar modelo: $error');
+        });
       
-      // Load model from assets
-      final modelPath = await ModelLoader().loadFromAssets('assets/models/vosk-model-small-pt-0.3.zip');
-
-      // Create model and recognizer with lower complexity
-      final model = await vosk.createModel(modelPath);
-      _recognizer = await vosk.createRecognizer(
-        model: model, 
-        sampleRate: 16000,
-        // Optional: Adjust these for performance
-        // complexity: RecognizerComplexity.low, // If such option exists
-      );
-      _speechService = await vosk.initSpeechService(_recognizer!);
-
-      // Optimize listeners
-      _speechService!.onPartial().listen((partial) async {
-        final extractedText = await compute(computeTextExtraction, partial);
-        _recognizerTextNotifier.value = extractedText;
+      _model = await _vosk.createModel(modelPath)
+        .catchError((error) {
+          if (kDebugMode) {
+            print('Model creation error: $error');
+          }
+          throw Exception('Falha ao criar modelo: $error');
+        });
+      
+      _recognizer = await _vosk.createRecognizer(
+        model: _model!, 
+        sampleRate: _sampleRate,
+      ).catchError((error) {
+        if (kDebugMode) {
+          print('Recognizer creation error: $error');
+        }
+        throw Exception('Falha ao criar reconhecedor: $error');
       });
+      
+      if (Platform.isAndroid) {
+        _speechService = await _vosk.initSpeechService(_recognizer!)
+          .catchError((error) {
+            if (kDebugMode) {
+              print('Speech service error: $error');
+            }
+            throw Exception('Falha ao iniciar serviço de fala: $error');
+          });
+        
+        _speechService!.onPartial().listen(
+          (partial) async {
+            try {
+              if (!mounted) return;
+              final extractedText = await compute(computeTextExtraction, partial);
+              setState(() {
+                _recognizedText = extractedText;
+              });
+            } catch (e) {
+              if (kDebugMode) {
+                print('Partial text processing error: $e');
+              }
+            }
+          },
+          onError: (e) {
+            if (kDebugMode) {
+              print('Partial listener error: $e');
+            }
+          },
+          cancelOnError: false,
+        );
 
-      _speechService!.onResult().listen((result) async {
-        final extractedText = await compute(computeTextExtraction, result);
-        _recognizerTextNotifier.value = extractedText;
-      });
+        _speechService!.onResult().listen(
+          (result) async {
+            try {
+              if (!mounted) return;
+              final extractedText = await compute(computeTextExtraction, result);
+              setState(() {
+                _recognizedText = extractedText;
+              });
+            } catch (e) {
+              if (kDebugMode) {
+                print('Result text processing error: $e');
+              }
+            }
+          },
+          onError: (e) {
+            if (kDebugMode) {
+              print('Result listener error: $e');
+            }
+          },
+          cancelOnError: false,
+        );
+      }
 
       if (mounted) {
-        setState(() => _isModelReady = true);
+        setState(() {
+          _isModelReady = true;
+          _isLoading = false;
+          _recognizedText = 'Pressione o botão para falar';
+        });
       }
     } catch (e) {
-      debugPrint('Vosk initialization error: $e');
-      _handleInitializationError();
+      if (kDebugMode) {
+        print('Vosk initialization error: $e');
+      }
+      if (mounted) {
+        setState(() {
+          _error = e.toString();
+          _isLoading = false;
+        });
+      }
     }
   }
 
   void _showPermissionError() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Permissão de microfone negada'),
-        backgroundColor: Colors.red,
-      )
-    );
-  }
-
-  void _handleInitializationError() {
+    setState(() {
+      _error = 'Permissão de microfone negada';
+      _isLoading = false;
+    });
+    
     if (mounted) {
-      setState(() {
-        _isModelReady = false;
-        _recognizerTextNotifier.value = 'Erro de inicialização do modelo';
-      });
-      
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Não foi possível inicializar o modelo de reconhecimento'),
+          content: Text('Permissão de microfone negada'),
           backgroundColor: Colors.red,
         )
       );
@@ -149,7 +230,7 @@ class _SpeechToTextScreenState extends State<SpeechToTextScreen> with WidgetsBin
   }
 
   void _startRecognition() async {
-    if (!_isModelReady) {
+    if (!_isModelReady || _isLoading) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Modelo não está pronto'),
@@ -160,13 +241,22 @@ class _SpeechToTextScreenState extends State<SpeechToTextScreen> with WidgetsBin
     }
     
     try {
-      setState(() => _isRecording = true);
-      await _speechService?.start();
+      setState(() {
+        _isRecording = true;
+        _recognizedText = 'Reconhecendo...';
+      });
+      
+      if (Platform.isAndroid) {
+        await _speechService?.start();
+      } else {
+      }
     } catch (e) {
-      debugPrint('Start recognition error: $e');
+      if (kDebugMode) {
+        print('Start recognition error: $e');
+      }
       setState(() {
         _isRecording = false;
-        _recognizerTextNotifier.value = 'Erro ao iniciar reconhecimento';
+        _recognizedText = 'Erro ao iniciar reconhecimento';
       });
     }
   }
@@ -176,14 +266,58 @@ class _SpeechToTextScreenState extends State<SpeechToTextScreen> with WidgetsBin
     
     try {
       setState(() => _isRecording = false);
-      await _speechService?.stop();
+      
+      if (Platform.isAndroid) {
+        await _speechService?.stop();
+      } else {
+        //para o IOS mas nem tem suporte
+      }
     } catch (e) {
-      debugPrint('Stop recognition error: $e');
+      if (kDebugMode) {
+        print('Stop recognition error: $e');
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_error != null) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('VOSK Speech Recognition'),
+        ),
+        body: Center(
+          child: Text(
+            'Erro: $_error',
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 18.0, color: Colors.red),
+          ),
+        ),
+      );
+    }
+    
+    if (_isLoading) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('VOSK Speech Recognition'),
+        ),
+        body: const Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text(
+                'Inicializando reconhecimento de voz...',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 18.0),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    
     return Scaffold(
       appBar: AppBar(
         title: const Text('VOSK Speech Recognition'),
@@ -194,15 +328,10 @@ class _SpeechToTextScreenState extends State<SpeechToTextScreen> with WidgetsBin
           children: [
             Padding(
               padding: const EdgeInsets.all(16.0),
-              child: ValueListenableBuilder<String>(
-                valueListenable: _recognizerTextNotifier,
-                builder: (context, text, child) {
-                  return Text(
-                    text,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(fontSize: 24.0)
-                  );
-                },
+              child: Text(
+                _recognizedText,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 24.0),
               ),
             ),
             const SizedBox(height: 16.0),
@@ -218,7 +347,17 @@ class _SpeechToTextScreenState extends State<SpeechToTextScreen> with WidgetsBin
                   color: Colors.white,
                 ),
               ),
-            )
+            ),
+            const SizedBox(height: 24.0),
+            Text(
+              _isModelReady 
+                ? 'Modelo carregado com sucesso' 
+                : 'Carregando modelo...',
+              style: TextStyle(
+                color: _isModelReady ? Colors.green : Colors.orange,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
           ],
         ),
       ),
